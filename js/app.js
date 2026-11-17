@@ -1,11 +1,19 @@
 import { LETTERS } from './letters.js';
+import { letterStrokes } from './strokes.js';
 import { scoreTrace } from './scoring.js';
-import { speak, letterText, praise } from './speech.js';
+import { sayLetter as speakLetter, speak, feedbackText, stopSpeaking } from './speech.js';
 import * as sfx from './sfx.js';
 
-const FONT_FAMILY = "'Andika', 'Comic Sans MS', sans-serif";
 const STORE_KEY = 'buchstaben-v1';
-const INK_COLORS = ['#ff5a7a', '#7c5cff', '#21a8f0', '#2fbf71', '#ff9f1c'];
+const INK_COLORS = ['#ff5a7a', '#21a8f0', '#2fbf71', '#ff9f1c', '#e14eca'];
+const ROAD = 17; // Breite der Spur in Buchstaben-Einheiten
+const DEMO_SPEED = 130; // Einheiten pro Sekunde beim Vormachen
+
+// Sichtbarer Bereich je Schreibweise (in Buchstaben-Einheiten)
+const VIEW = {
+  upper: { top: -32, bottom: 114, maxW: 100, lines: [0, 50, 100] },
+  lower: { top: -4, bottom: 156, maxW: 82, lines: [0, 50, 100, 150] },
+};
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -25,13 +33,15 @@ const progress = loadProgress();
 const state = {
   letterCase: 'upper',
   index: 0,
-  strokes: [],
+  strokes: [], // gemalte Striche in Buchstaben-Einheiten
   current: null,
   activePointer: null,
   penSeen: false,
-  glyph: null,
+  letter: null, // Vorlage (letterStrokes)
+  view: null, // { k, ox, oy, w, h }
   inkColor: INK_COLORS[0],
   scored: false,
+  demo: null, // laufende Vormach-Animation
 };
 
 const charOf = (letter, c = state.letterCase) => (c === 'upper' ? letter.upper : letter.lower);
@@ -96,148 +106,289 @@ function openLetter(i) {
   state.inkColor = INK_COLORS[i % INK_COLORS.length];
   $('#result').hidden = true;
   const letter = currentLetter();
+  state.letter = letterStrokes(charOf(letter));
   $('#hint-emoji').textContent = letter.emoji;
   showScreen('trace');
   resizeCanvas();
   sayLetter();
+  setTimeout(() => { if (!state.strokes.length) startDemo(); }, 500);
 }
 
 function sayLetter() {
-  const letter = currentLetter();
   const hint = $('#btn-speak');
   hint.classList.add('talking');
   clearTimeout(sayLetter.t);
-  sayLetter.t = setTimeout(() => hint.classList.remove('talking'), 2200);
-  speak(letterText(letter));
+  sayLetter.t = setTimeout(() => hint.classList.remove('talking'), 3200);
+  speakLetter(currentLetter());
 }
 
-/** Schriftgröße und Lage so wählen, dass jeder Buchstabe auf die Schreiblinien passt. */
-function layoutGlyph(w, h, ch) {
-  const ref = 100;
-  ctx.font = `700 ${ref}px ${FONT_FAMILY}`;
-  const m = (t) => ctx.measureText(t);
-  const top = Math.max(m('ÄÖÜbdfhklt').actualBoundingBoxAscent, m('H').actualBoundingBoxAscent);
-  const cap = m('H').actualBoundingBoxAscent;
-  const xh = m('x').actualBoundingBoxAscent;
-  const desc = m('gjpqy').actualBoundingBoxDescent;
-  const widest = Math.max(m('W').width, m('M').width, m('m').width, m('w').width);
-
-  const fontSize = Math.min((h * 0.84) / ((top + desc) / ref), (w * 0.86) / (widest / ref));
-  const k = fontSize / ref;
-  const total = (top + desc) * k;
-  const baseline = (h - total) / 2 + top * k;
-  return {
-    char: ch,
-    font: `700 ${fontSize}px ${FONT_FAMILY}`,
-    fontSize,
-    x: w / 2,
-    y: baseline,
-    width: w,
-    height: h,
-    lines: {
-      cap: baseline - cap * k,
-      x: baseline - xh * k,
-      base: baseline,
-      desc: baseline + desc * k,
-    },
-  };
+/** Maßstab und Lage so wählen, dass der Buchstabe groß auf die Schreiblinien passt. */
+function layout(w, h) {
+  const v = VIEW[state.letterCase];
+  const box = state.letter.box;
+  const k = Math.min((h * 0.92) / (v.bottom - v.top), (w * 0.84) / v.maxW);
+  const ox = w / 2 - ((box.minX + box.maxX) / 2) * k;
+  const oy = (h - (v.bottom - v.top) * k) / 2 - v.top * k;
+  return { k, ox, oy, w, h };
 }
+
+const toPx = (p) => ({ x: state.view.ox + p.x * state.view.k, y: state.view.oy + p.y * state.view.k });
+const toUnits = (x, y) => ({ x: (x - state.view.ox) / state.view.k, y: (y - state.view.oy) / state.view.k });
 
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
+  if (!rect.width || !rect.height || !state.letter) return;
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
-  const oldGlyph = state.glyph;
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  state.glyph = layoutGlyph(rect.width, rect.height, charOf(currentLetter()));
-  // Bereits gemalte Linien bei Größenänderung mitskalieren.
-  if (oldGlyph && oldGlyph.char === state.glyph.char && state.strokes.length) {
-    const s = state.glyph.fontSize / oldGlyph.fontSize;
-    const dx = state.glyph.x - oldGlyph.x * s;
-    const dy = state.glyph.y - oldGlyph.y * s;
-    state.strokes = state.strokes.map((st) => st.map((p) => ({ x: p.x * s + dx, y: p.y * s + dy })));
-  }
+  state.view = layout(rect.width, rect.height);
   draw();
 }
 
-function drawGuides(g) {
-  const { width: w, lines } = g;
+function drawGuides() {
+  const { w, k, oy } = state.view;
+  const v = VIEW[state.letterCase];
   const pad = 12;
   ctx.save();
-  ctx.lineWidth = 2;
-  ctx.strokeStyle = '#d9d2f2';
-  for (const y of [lines.cap, lines.desc]) {
+  for (const u of v.lines) {
+    const y = oy + u * k;
+    ctx.setLineDash(u === 50 ? [10, 10] : []);
+    ctx.lineWidth = u === 100 ? 4 : 2;
+    ctx.strokeStyle = u === 100 ? '#b9aee6' : '#ddd6f3';
     ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(w - pad, y); ctx.stroke();
   }
-  ctx.setLineDash([10, 10]);
-  ctx.beginPath(); ctx.moveTo(pad, lines.x); ctx.lineTo(w - pad, lines.x); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.lineWidth = 4;
-  ctx.strokeStyle = '#b9aee6';
-  ctx.beginPath(); ctx.moveTo(pad, lines.base); ctx.lineTo(w - pad, lines.base); ctx.stroke();
   ctx.restore();
 }
 
-function drawGlyph(g) {
+function tracePath(points) {
+  ctx.beginPath();
+  const p0 = toPx(points[0]);
+  ctx.moveTo(p0.x, p0.y);
+  for (let i = 1; i < points.length; i++) {
+    const p = toPx(points[i]);
+    ctx.lineTo(p.x, p.y);
+  }
+}
+
+/** Die Spur, auf der das Kind fahren soll. */
+function drawRoad() {
+  const { k } = state.view;
   ctx.save();
-  ctx.font = g.font;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'alphabetic';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#ece7ff';
   ctx.fillStyle = '#ece7ff';
-  ctx.fillText(g.char, g.x, g.y);
-  ctx.lineWidth = Math.max(2, g.fontSize * 0.008);
-  ctx.setLineDash([g.fontSize * 0.02, g.fontSize * 0.02]);
-  ctx.strokeStyle = '#a796ee';
-  ctx.strokeText(g.char, g.x, g.y);
+  ctx.lineWidth = ROAD * k;
+  for (const s of state.letter.strokes) {
+    if (s.dot) {
+      const p = toPx(s.points[0]);
+      ctx.beginPath(); ctx.arc(p.x, p.y, (ROAD / 2) * k * 1.1, 0, Math.PI * 2); ctx.fill();
+    } else {
+      tracePath(s.points);
+      ctx.stroke();
+    }
+  }
+  // Mittellinie gepunktet
+  ctx.strokeStyle = '#b3a5ef';
+  ctx.lineWidth = Math.max(2, 1.4 * k);
+  ctx.setLineDash([2.5 * k, 3.5 * k]);
+  for (const s of state.letter.strokes) {
+    if (s.dot) continue;
+    tracePath(s.points);
+    ctx.stroke();
+  }
   ctx.restore();
+}
+
+function pointAt(points, frac) {
+  const i = Math.min(points.length - 2, Math.max(0, Math.floor(frac * (points.length - 1))));
+  return { p: points[i], q: points[i + 1] };
+}
+
+/** Pfeile für die Schreibrichtung und Startpunkte mit Nummer. */
+function drawDirections() {
+  const { k } = state.view;
+  const strokes = state.letter.strokes;
+  ctx.save();
+  // Pfeile
+  ctx.fillStyle = '#7c5cff';
+  for (const s of strokes) {
+    if (s.dot) continue;
+    const n = Math.max(1, Math.round(s.length / 55));
+    for (let j = 1; j <= n; j++) {
+      const frac = (j - 0.35) / n;
+      const { p, q } = pointAt(s.points, Math.min(0.92, Math.max(0.25, frac)));
+      const a = toPx(p), b = toPx(q);
+      const ang = Math.atan2(b.y - a.y, b.x - a.x);
+      const size = 6.5 * k;
+      ctx.save();
+      ctx.translate(a.x, a.y);
+      ctx.rotate(ang);
+      ctx.beginPath();
+      ctx.moveTo(size * 0.9, 0);
+      ctx.lineTo(-size * 0.6, -size * 0.75);
+      ctx.lineTo(-size * 0.25, 0);
+      ctx.lineTo(-size * 0.6, size * 0.75);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+  // Startpunkte (grün) mit Reihenfolge
+  const many = strokes.length > 1;
+  startMarkers().forEach((m, i) => {
+    const s = strokes[i];
+    const p = toPx(m);
+    const r = (s.dot ? 6 : 7.5) * k;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = '#2fbf71';
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, 1.2 * k);
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
+    if (many) {
+      ctx.fillStyle = '#fff';
+      ctx.font = `700 ${r * 1.35}px 'Andika', sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(i + 1), p.x, p.y + r * 0.08);
+    }
+  });
+  ctx.restore();
+}
+
+/** Startpunkte; liegen zwei aufeinander, wird der spätere etwas verschoben. */
+function startMarkers() {
+  const MIN = 15;
+  const out = [];
+  for (const s of state.letter.strokes) {
+    let m = { ...s.points[0] };
+    for (const prev of out) {
+      const d = Math.hypot(m.x - prev.x, m.y - prev.y);
+      if (d >= MIN) continue;
+      if (d > 1) {
+        m = { x: prev.x + ((m.x - prev.x) / d) * MIN, y: prev.y + ((m.y - prev.y) / d) * MIN };
+      } else if (!s.dot) {
+        // Gleicher Startpunkt: ein Stück entlang des eigenen Strichs
+        const idx = Math.min(s.points.length - 1, Math.round((MIN / s.length) * (s.points.length - 1)));
+        m = { ...s.points[idx] };
+      }
+    }
+    out.push(m);
+  }
+  return out;
 }
 
 function inkWidth() {
-  return Math.max(8, state.glyph.fontSize * 0.075);
+  return Math.max(6, ROAD * 0.55 * state.view.k);
 }
 
-function drawStroke(s) {
+function drawInkStroke(s) {
   if (!s.length) return;
   ctx.lineWidth = inkWidth();
-  if (s.length === 1) {
+  const pts = s.map(toPx);
+  if (pts.length === 1) {
     ctx.beginPath();
-    ctx.arc(s[0].x, s[0].y, inkWidth() / 2, 0, Math.PI * 2);
+    ctx.arc(pts[0].x, pts[0].y, inkWidth() / 2, 0, Math.PI * 2);
     ctx.fill();
     return;
   }
   ctx.beginPath();
-  ctx.moveTo(s[0].x, s[0].y);
-  for (let i = 1; i < s.length - 1; i++) {
-    // Glatte Linie durch Mittelpunkte
-    const mx = (s[i].x + s[i + 1].x) / 2;
-    const my = (s[i].y + s[i + 1].y) / 2;
-    ctx.quadraticCurveTo(s[i].x, s[i].y, mx, my);
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length - 1; i++) {
+    const mx = (pts[i].x + pts[i + 1].x) / 2;
+    const my = (pts[i].y + pts[i + 1].y) / 2;
+    ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
   }
-  const last = s[s.length - 1];
+  const last = pts[pts.length - 1];
   ctx.lineTo(last.x, last.y);
   ctx.stroke();
 }
 
+/** Vormach-Animation: zeigt, wo man ansetzt und wie man fährt. */
+function drawDemo(progressUnits) {
+  const { k } = state.view;
+  let left = progressUnits;
+  let pen = null;
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(255, 159, 28, 0.85)';
+  ctx.fillStyle = 'rgba(255, 159, 28, 0.85)';
+  ctx.lineWidth = ROAD * 0.5 * k;
+  for (const s of state.letter.strokes) {
+    const len = s.dot ? 8 : s.length;
+    if (left <= 0) break;
+    const frac = Math.min(1, left / len);
+    if (s.dot) {
+      const p = toPx(s.points[0]);
+      ctx.beginPath(); ctx.arc(p.x, p.y, ROAD * 0.3 * k, 0, Math.PI * 2); ctx.fill();
+      pen = p;
+    } else {
+      const n = Math.max(1, Math.round(frac * (s.points.length - 1)));
+      tracePath(s.points.slice(0, n + 1));
+      ctx.stroke();
+      pen = toPx(s.points[n]);
+    }
+    left -= len + 30; // kurze Pause zwischen Strichen
+  }
+  if (pen) {
+    ctx.font = `${ROAD * 1.6 * k}px sans-serif`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText('✏️', pen.x - ROAD * 0.3 * k, pen.y + ROAD * 0.5 * k);
+  }
+  ctx.restore();
+}
+
+function demoTotal() {
+  return state.letter.strokes.reduce((s, st) => s + (st.dot ? 8 : st.length) + 30, 0);
+}
+
+function startDemo() {
+  stopDemo();
+  if (state.scored || !$('#trace').classList.contains('active')) return;
+  const total = demoTotal();
+  const t0 = performance.now();
+  const demo = { units: 0, raf: 0 };
+  state.demo = demo;
+  const tick = (t) => {
+    if (state.demo !== demo) return;
+    demo.units = ((t - t0) / 1000) * DEMO_SPEED;
+    draw();
+    if (demo.units < total + 40) demo.raf = requestAnimationFrame(tick);
+    else { state.demo = null; draw(); }
+  };
+  demo.raf = requestAnimationFrame(tick);
+}
+
+function stopDemo() {
+  if (state.demo) cancelAnimationFrame(state.demo.raf);
+  state.demo = null;
+}
+
 function draw() {
-  const g = state.glyph;
-  if (!g) return;
-  ctx.clearRect(0, 0, g.width, g.height);
-  drawGuides(g);
-  drawGlyph(g);
+  if (!state.view) return;
+  const { w, h } = state.view;
+  ctx.clearRect(0, 0, w, h);
+  drawGuides();
+  drawRoad();
+  if (state.demo) drawDemo(state.demo.units);
+  drawDirections();
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.strokeStyle = state.inkColor;
   ctx.fillStyle = state.inkColor;
-  state.strokes.forEach(drawStroke);
+  state.strokes.forEach(drawInkStroke);
   ctx.restore();
 }
 
 function pointFrom(e) {
   const r = canvas.getBoundingClientRect();
-  return { x: e.clientX - r.left, y: e.clientY - r.top };
+  return toUnits(e.clientX - r.left, e.clientY - r.top);
 }
 
 canvas.addEventListener('pointerdown', (e) => {
@@ -246,6 +397,7 @@ canvas.addEventListener('pointerdown', (e) => {
   if (state.penSeen && e.pointerType === 'touch') return;
   if (state.activePointer !== null || state.scored) return;
   e.preventDefault();
+  stopDemo();
   state.activePointer = e.pointerId;
   canvas.setPointerCapture(e.pointerId);
   state.current = [pointFrom(e)];
@@ -256,11 +408,11 @@ canvas.addEventListener('pointerdown', (e) => {
 canvas.addEventListener('pointermove', (e) => {
   if (e.pointerId !== state.activePointer) return;
   e.preventDefault();
-  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
   for (const ev of (events.length ? events : [e])) {
     const p = pointFrom(ev);
     const last = state.current[state.current.length - 1];
-    if (Math.hypot(p.x - last.x, p.y - last.y) >= 1.5) state.current.push(p);
+    if (Math.hypot(p.x - last.x, p.y - last.y) >= 0.6) state.current.push(p);
   }
   draw();
 });
@@ -285,12 +437,14 @@ function finish() {
   if (state.scored) return;
   if (!state.strokes.some((s) => s.length > 2)) {
     sfx.boop();
-    speak('Fahr den Buchstaben mit dem Finger oder Stift nach.');
+    speak('Fang beim grünen Punkt an und fahr den Pfeilen nach.');
+    startDemo();
     return;
   }
-  const res = scoreTrace(state.glyph, state.strokes);
+  stopDemo();
+  const res = scoreTrace(state.letter, state.strokes);
   state.scored = true;
-  const ch = state.glyph.char;
+  const ch = state.letter.char;
   const prevBest = progress.best[ch] || 0;
   progress.best[ch] = Math.max(prevBest, res.stars);
   progress.total += res.points;
@@ -298,14 +452,17 @@ function finish() {
   showResult(res);
 }
 
+const TIP_ICONS = { missing: '✏️ Strich fehlt', direction: '🟢➜ Richtung', extra: '🚫 Kritzeln', shape: '⭕ Form', accuracy: '🎯 Genauer' };
+
 function showResult(res) {
   $('#result-stars').innerHTML = starsHtml(res.stars);
   $('#result-points').textContent = `+${res.points}`;
+  $('#result-tip').textContent = res.stars < 3 ? (TIP_ICONS[res.feedback] || '') : '';
   $('#result').hidden = false;
   renderTotal(true);
   if (res.stars >= 1) sfx.win(res.stars); else sfx.boop();
   if (res.stars === 3) startConfetti();
-  setTimeout(() => speak(praise(res.stars), { rate: 0.95, pitch: 1.2 }), 300);
+  setTimeout(() => speak(feedbackText(res), { rate: 0.9, pitch: 1.15 }), 350);
 }
 
 function nextLetter() {
@@ -316,15 +473,17 @@ function nextLetter() {
 
 $('#btn-home').addEventListener('click', () => {
   stopConfetti();
-  window.speechSynthesis?.cancel();
+  stopDemo();
+  stopSpeaking();
   renderGrid();
   showScreen('home');
 });
 $('#btn-speak').addEventListener('click', sayLetter);
+$('#btn-demo').addEventListener('click', () => { clearDrawing(); startDemo(); });
 $('#btn-clear').addEventListener('click', () => { sfx.pop(); clearDrawing(); });
 $('#btn-done').addEventListener('click', finish);
 $('#btn-next').addEventListener('click', nextLetter);
-$('#btn-again').addEventListener('click', () => { sfx.pop(); clearDrawing(); });
+$('#btn-again').addEventListener('click', () => { sfx.pop(); clearDrawing(); startDemo(); });
 $('#btn-result-next').addEventListener('click', nextLetter);
 
 window.addEventListener('resize', () => {
@@ -339,7 +498,7 @@ function startConfetti() {
   c.width = r.width;
   c.height = r.height;
   const cx = c.getContext('2d');
-  const colors = [...INK_COLORS, '#ffc531'];
+  const colors = [...INK_COLORS, '#ffc531', '#7c5cff'];
   const parts = Array.from({ length: 120 }, () => ({
     x: r.width / 2,
     y: r.height / 2,
@@ -380,7 +539,7 @@ function stopConfetti() {
 
 // ---------- Start ----------
 async function init() {
-  try { await document.fonts.load(`700 100px ${FONT_FAMILY}`, 'Aa'); } catch { /* Ersatzschrift */ }
+  try { await document.fonts.load("700 40px 'Andika'", 'Aa'); } catch { /* Ersatzschrift */ }
   renderGrid();
   renderTotal();
 }
@@ -391,4 +550,4 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 }
 
 // Für Tests
-window.__app = { state, progress, scoreTrace, openLetter, finish };
+window.__app = { state, progress, scoreTrace, letterStrokes, openLetter, finish, toPx };
