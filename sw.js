@@ -1,5 +1,5 @@
 // Service Worker: speichert alle Dateien, damit die App offline funktioniert.
-const CACHE = 'buchstaben-v1';
+const CACHE = 'buchstaben-v2';
 const FILES = [
   './',
   'index.html',
@@ -8,6 +8,7 @@ const FILES = [
   'js/app.js',
   'js/letters.js',
   'js/scoring.js',
+  'js/strokes.js',
   'js/speech.js',
   'js/sfx.js',
   'fonts/andika-latin-700-normal.woff2',
